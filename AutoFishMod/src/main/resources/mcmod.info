@@ -1,0 +1,16 @@
+[
+{
+  "modid": "autofish",
+  "name": "Auto Fish Mod",
+  "description": "Automatically catches fish by listening to sound events (subtitles).",
+  "version": "${version}",
+  "mcversion": "${mcversion}",
+  "url": "",
+  "updateUrl": "",
+  "authorList": ["User"],
+  "credits": "",
+  "logoFile": "",
+  "screenshots": [],
+  "dependencies": []
+}
+]
