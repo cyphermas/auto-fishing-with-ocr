@@ -1,13 +1,17 @@
 import time
 import threading
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, messagebox
+from tkinter import filedialog, scrolledtext, messagebox, ttk
 import pyautogui
 import pytesseract
 import cv2
 import numpy as np
 from PIL import Image, ImageTk, ImageGrab
 import os
+import win32gui
+import win32ui
+import win32con
+import win32api
 
 # ================= 配置区域 =================
 
@@ -25,6 +29,60 @@ COOLDOWN = 2.0
 
 # ===========================================
 
+class WindowSelector:
+    def __init__(self, master, callback):
+        self.master = master
+        self.callback = callback
+        self.top = tk.Toplevel(master)
+        self.top.title("选择游戏窗口")
+        self.top.geometry("400x300")
+        
+        tk.Label(self.top, text="请选择 Minecraft 游戏窗口:").pack(pady=5)
+        
+        frame_list = tk.Frame(self.top)
+        frame_list.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        self.listbox = tk.Listbox(frame_list, selectmode=tk.SINGLE)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        
+        scrollbar = tk.Scrollbar(frame_list, orient="vertical", command=self.listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.listbox.config(yscrollcommand=scrollbar.set)
+        
+        self.windows = []
+        self.refresh_windows()
+        
+        frame_btn = tk.Frame(self.top)
+        frame_btn.pack(fill="x", padx=5, pady=5)
+        
+        tk.Button(frame_btn, text="刷新列表", command=self.refresh_windows).pack(side="left")
+        tk.Button(frame_btn, text="确定", command=self.confirm).pack(side="right")
+        
+    def refresh_windows(self):
+        self.listbox.delete(0, tk.END)
+        self.windows = []
+        
+        def enum_handler(hwnd, ctx):
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd)
+                if title:
+                    self.windows.append((hwnd, title))
+        
+        win32gui.EnumWindows(enum_handler, None)
+        # 优先显示包含 Minecraft 的窗口
+        self.windows.sort(key=lambda x: "Minecraft" not in x[1])
+        
+        for hwnd, title in self.windows:
+            self.listbox.insert(tk.END, f"[{hwnd}] {title}")
+            
+    def confirm(self):
+        selection = self.listbox.curselection()
+        if selection:
+            index = selection[0]
+            hwnd, title = self.windows[index]
+            self.callback(hwnd, title)
+            self.top.destroy()
+
 class RegionSelector:
     def __init__(self, master, callback):
         self.master = master
@@ -40,8 +98,6 @@ class RegionSelector:
         self.top = tk.Toplevel(master)
         self.top.attributes('-fullscreen', True)
         self.top.attributes('-topmost', True)
-        self.top.attributes('-alpha', 0.3) # 半透明，方便看到后面，但为了看清截图，最好是不透明然后画框
-        # 实际上，为了模拟“截图选区”，我们应该显示静态截图
         self.top.attributes('-alpha', 1.0)
         
         self.canvas = tk.Canvas(self.top, cursor="cross", highlightthickness=0)
@@ -91,7 +147,7 @@ class AutoFishApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Minecraft 自动钓鱼 (字幕识别版)")
-        self.root.geometry("600x700")
+        self.root.geometry("600x800")
         
         # 变量
         self.tesseract_path = tk.StringVar(value=DEFAULT_TESSERACT_CMD)
@@ -100,6 +156,12 @@ class AutoFishApp:
         self.thread = None
         self.debug_mode = tk.BooleanVar(value=False)
         self.lang_var = tk.StringVar(value="chi_sim+eng")
+        
+        # 后台模式相关变量
+        self.target_hwnd = None
+        self.target_title = tk.StringVar(value="未选择窗口")
+        self.background_mode = tk.BooleanVar(value=False)
+        self.relative_region = None # 相对于窗口左上角的区域 (x, y, w, h)
         
         self.setup_ui()
         
@@ -121,13 +183,26 @@ class AutoFishApp:
         tk.Radiobutton(frame_lang, text="中英文 (较慢)", variable=self.lang_var, value="chi_sim+eng").pack(side="left", padx=5)
         tk.Radiobutton(frame_lang, text="仅英文 (较快)", variable=self.lang_var, value="eng").pack(side="left", padx=5)
         
-        # 2. 区域设置
-        frame_region = tk.LabelFrame(self.root, text="识别区域", padx=10, pady=10)
-        frame_region.pack(fill="x", padx=10, pady=5)
+        # 2. 窗口与区域设置
+        frame_target = tk.LabelFrame(self.root, text="目标设置", padx=10, pady=10)
+        frame_target.pack(fill="x", padx=10, pady=5)
         
-        self.lbl_region_val = tk.Label(frame_region, text=f"当前区域: {self.region}", font=("Consolas", 10))
+        # 窗口选择
+        frame_win = tk.Frame(frame_target)
+        frame_win.pack(fill="x", pady=2)
+        tk.Label(frame_win, text="目标窗口:").pack(side="left")
+        tk.Label(frame_win, textvariable=self.target_title, fg="blue").pack(side="left", padx=5)
+        tk.Button(frame_win, text="选择窗口", command=self.select_window).pack(side="right")
+        
+        # 模式选择
+        tk.Checkbutton(frame_target, text="启用后台模式 (窗口被遮挡也能运行)", variable=self.background_mode, command=self.on_mode_change).pack(anchor="w", pady=5)
+        
+        # 区域显示
+        self.lbl_region_val = tk.Label(frame_target, text=f"当前屏幕区域: {self.region}", font=("Consolas", 10))
         self.lbl_region_val.pack(pady=5)
-        tk.Button(frame_region, text="选取屏幕区域", command=self.select_region, bg="#e1f5fe").pack(fill="x")
+        
+        tk.Button(frame_target, text="选取识别区域", command=self.select_region, bg="#e1f5fe").pack(fill="x")
+        tk.Label(frame_target, text="注意: 选取区域时请确保游戏窗口可见", fg="gray", font=("Arial", 8)).pack()
         
         # 3. 控制按钮
         frame_ctrl = tk.Frame(self.root, padx=10, pady=10)
@@ -162,6 +237,27 @@ class AutoFishApp:
         if filename:
             self.tesseract_path.set(filename)
 
+    def select_window(self):
+        WindowSelector(self.root, self.on_window_selected)
+        
+    def on_window_selected(self, hwnd, title):
+        self.target_hwnd = hwnd
+        self.target_title.set(title)
+        self.log(f"已选择窗口: {title} ({hwnd})")
+        # 切换到后台模式推荐
+        self.background_mode.set(True)
+        self.on_mode_change()
+
+    def on_mode_change(self):
+        if self.background_mode.get():
+            if not self.target_hwnd:
+                messagebox.showwarning("提示", "请先选择一个游戏窗口！")
+                self.background_mode.set(False)
+                return
+            self.lbl_region_val.config(text=f"当前模式: 后台窗口 (区域将自动转换为相对坐标)")
+        else:
+            self.lbl_region_val.config(text=f"当前模式: 屏幕截图 (区域: {self.region})")
+
     def select_region(self):
         self.root.iconify() # 最小化主窗口
         # 延迟 200ms 等待窗口最小化动画完成，避免截取到主窗口
@@ -169,8 +265,22 @@ class AutoFishApp:
         
     def on_region_selected(self, region):
         self.region = region
-        self.lbl_region_val.config(text=f"当前区域: {self.region}")
         self.root.deiconify() # 恢复主窗口
+        
+        if self.target_hwnd:
+            # 如果选择了窗口，计算相对坐标
+            try:
+                rect = win32gui.GetWindowRect(self.target_hwnd)
+                win_x, win_y = rect[0], rect[1]
+                # 相对坐标 = 屏幕坐标 - 窗口左上角坐标
+                rel_x = region[0] - win_x
+                rel_y = region[1] - win_y
+                self.relative_region = (rel_x, rel_y, region[2], region[3])
+                self.log(f"已更新相对区域: {self.relative_region}")
+            except Exception as e:
+                self.log(f"计算相对坐标失败: {e}")
+        
+        self.lbl_region_val.config(text=f"当前区域: {self.region}")
         self.log(f"区域已更新: {self.region}")
 
     def log(self, message):
@@ -189,11 +299,18 @@ class AutoFishApp:
             
         pytesseract.pytesseract.tesseract_cmd = tess_cmd
         
+        if self.background_mode.get() and not self.target_hwnd:
+            messagebox.showerror("错误", "后台模式需要先选择窗口！")
+            return
+
         self.running = True
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.log("正在启动监听线程...")
-        self.log("请切换回游戏，确保字幕已开启。")
+        if self.background_mode.get():
+            self.log("后台模式已开启，你可以最小化游戏或遮挡它。")
+        else:
+            self.log("请切换回游戏，确保字幕已开启。")
         
         self.thread = threading.Thread(target=self.fishing_loop)
         self.thread.daemon = True
@@ -208,6 +325,10 @@ class AutoFishApp:
     def process_image(self, image):
         """图像预处理"""
         img_np = np.array(image)
+        # 如果是 RGBA (win32 截图可能带 alpha)，转 RGB
+        if img_np.shape[2] == 4:
+            img_np = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
+            
         gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
         
@@ -222,6 +343,63 @@ class AutoFishApp:
         resized = cv2.resize(thresh, dim, interpolation=cv2.INTER_NEAREST)
         return resized
 
+    def capture_window(self, hwnd, region):
+        """
+        使用 win32 API 截取指定窗口的指定区域
+        region: (x, y, w, h) 相对于窗口左上角
+        """
+        try:
+            # 获取窗口设备上下文
+            wDC = win32gui.GetWindowDC(hwnd)
+            dcObj = win32ui.CreateDCFromHandle(wDC)
+            cDC = dcObj.CreateCompatibleDC()
+            
+            x, y, w, h = region
+            
+            # 创建位图
+            dataBitMap = win32ui.CreateBitmap()
+            dataBitMap.CreateCompatibleBitmap(dcObj, w, h)
+            
+            cDC.SelectObject(dataBitMap)
+            
+            # 截图 (BitBlt)
+            # 注意：对于某些硬件加速窗口，如果被遮挡，BitBlt 可能会截取到黑色或遮挡物
+            # PrintWindow 是另一种选择，但速度较慢且可能不兼容
+            # 这里使用 BitBlt，它通常对 Minecraft 有效
+            cDC.BitBlt((0, 0), (w, h), dcObj, (x, y), win32con.SRCCOPY)
+            
+            # 转换为 PIL Image
+            bmpinfo = dataBitMap.GetInfo()
+            bmpstr = dataBitMap.GetBitmapBits(True)
+            
+            img = Image.frombuffer(
+                'RGB',
+                (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                bmpstr, 'raw', 'BGRX', 0, 1)
+                
+            # 清理资源
+            win32gui.DeleteObject(dataBitMap.GetHandle())
+            cDC.DeleteDC()
+            dcObj.DeleteDC()
+            win32gui.ReleaseDC(hwnd, wDC)
+            
+            return img
+        except Exception as e:
+            # self.log(f"截图失败: {e}") # 避免刷屏
+            return None
+
+    def send_click(self, hwnd):
+        """发送后台右键点击"""
+        # WM_RBUTTONDOWN = 0x0204
+        # WM_RBUTTONUP = 0x0205
+        # MK_RBUTTON = 0x0002
+        try:
+            win32api.PostMessage(hwnd, win32con.WM_RBUTTONDOWN, win32con.MK_RBUTTON, 0)
+            time.sleep(0.1)
+            win32api.PostMessage(hwnd, win32con.WM_RBUTTONUP, 0, 0)
+        except Exception as e:
+            self.log(f"点击失败: {e}")
+
     def fishing_loop(self):
         last_action_time = time.time()
         
@@ -232,16 +410,39 @@ class AutoFishApp:
                     time.sleep(0.1)
                     continue
 
-                # 截图
-                try:
-                    screenshot = ImageGrab.grab(bbox=(
-                        self.region[0], 
-                        self.region[1], 
-                        self.region[0] + self.region[2], 
-                        self.region[1] + self.region[3]
-                    ))
-                except Exception as e:
-                    self.log(f"截图失败: {e}")
+                screenshot = None
+                
+                # 截图逻辑
+                if self.background_mode.get() and self.target_hwnd:
+                    if self.relative_region:
+                        screenshot = self.capture_window(self.target_hwnd, self.relative_region)
+                    else:
+                        # 如果没有相对区域，尝试使用默认的右下角估算
+                        try:
+                            rect = win32gui.GetWindowRect(self.target_hwnd)
+                            w = rect[2] - rect[0]
+                            h = rect[3] - rect[1]
+                            # 估算右下角
+                            est_x = int(w * 0.7)
+                            est_y = int(h * 0.7)
+                            est_w = int(w * 0.25)
+                            est_h = int(h * 0.2)
+                            screenshot = self.capture_window(self.target_hwnd, (est_x, est_y, est_w, est_h))
+                        except:
+                            pass
+                else:
+                    # 屏幕截图模式
+                    try:
+                        screenshot = ImageGrab.grab(bbox=(
+                            self.region[0], 
+                            self.region[1], 
+                            self.region[0] + self.region[2], 
+                            self.region[1] + self.region[3]
+                        ))
+                    except Exception as e:
+                        self.log(f"截图失败: {e}")
+
+                if screenshot is None:
                     time.sleep(1)
                     continue
 
@@ -299,13 +500,20 @@ class AutoFishApp:
                 
                 if detected:
                     self.log("收杆！")
-                    pyautogui.click(button='right')
+                    
+                    if self.background_mode.get() and self.target_hwnd:
+                        self.send_click(self.target_hwnd)
+                    else:
+                        pyautogui.click(button='right')
                     
                     self.log(f"等待 {RECAST_DELAY} 秒后重新抛竿...")
                     time.sleep(RECAST_DELAY)
                     
                     self.log("抛竿！")
-                    pyautogui.click(button='right')
+                    if self.background_mode.get() and self.target_hwnd:
+                        self.send_click(self.target_hwnd)
+                    else:
+                        pyautogui.click(button='right')
                     
                     last_action_time = time.time()
                 
